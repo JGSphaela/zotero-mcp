@@ -31,6 +31,16 @@ def test_search_items_no_results(mock_zotero: Any) -> None:
     assert "No items found" in result
 
 
+def test_search_items_api_error(mock_zotero: Any) -> None:
+    """Test search returns readable errors when Zotero is unreachable"""
+    mock_zotero.items.side_effect = RuntimeError("Local API is not enabled")
+
+    result = search_items("test")
+
+    assert "Error searching Zotero items" in result
+    assert "Local API is not enabled" in result
+
+
 def test_search_items_custom_params(
     mock_zotero: Any, sample_item: dict[str, Any]
 ) -> None:

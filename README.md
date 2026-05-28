@@ -1,55 +1,85 @@
-# Model Context Protocol server for Zotero
+# Zotero MCP Research Fork
 
-[![GitHub branch status](https://img.shields.io/github/check-runs/kujenga/zotero-mcp/main)](https://github.com/kujenga/zotero-mcp/actions)
-[![PyPI - Version](https://img.shields.io/pypi/v/zotero-mcp)](https://pypi.org/project/zotero-mcp/)
+This repository is a research-workflow fork of
+[kujenga/zotero-mcp](https://github.com/kujenga/zotero-mcp). The original
+project is a compact Model Context Protocol (MCP) server for Zotero with three
+core read-only tools: search, metadata lookup, and full-text lookup.
 
-This project is a python server that implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) for [Zotero](https://www.zotero.org/), giving you access to your Zotero library within AI assistants. It is intended to implement a small but maximally useful set of interactions with Zotero for use with [MCP clients](https://modelcontextprotocol.io/clients).
+This fork keeps that small, local-first design, but adds tools that make Zotero
+more useful as an academic paper knowledge base for LLMs:
 
-<a href="https://glama.ai/mcp/servers/jknz38ntu4">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/jknz38ntu4/badge" alt="Zotero Server MCP server" />
-</a>
+- API health checks and setup diagnostics
+- DOI-first lookup for citation grounding
+- Collection, tag, child-note, and attachment navigation
+- Friendlier error handling when Zotero is closed or the local API is disabled
+- Tests against current `mcp`, `pyzotero`, and Python 3.13
 
-## Features
+The current fork is still intentionally read-only. Importing PDFs, editing
+metadata, creating collections, and bulk library cleanup should be added behind
+explicit opt-in write controls.
 
-This MCP server provides the following tools:
+## Differences from upstream
 
-- `zotero_search_items`: Search for items in your Zotero library using a text query
-- `zotero_item_metadata`: Get detailed metadata information about a specific Zotero item
-- `zotero_item_fulltext`: Get the full text of a specific Zotero item (i.e. PDF contents)
+| Area | Upstream `kujenga/zotero-mcp` | This fork |
+| --- | --- | --- |
+| Scope | Minimal Zotero read access | Research knowledge-management workflow |
+| Tools | 3 tools | 9 tools |
+| Diagnostics | Basic exceptions | `zotero_healthcheck` and readable API errors |
+| Citation grounding | Search only | DOI-normalized lookup |
+| Library navigation | Items only | Collections, collection items, tags, child notes, attachments |
+| Metadata | Upstream package metadata | Fork repository and issue links |
 
-These can be discovered and accessed through any MCP client or through the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector).
+## Tools
 
-Each tool returns formatted text containing relevant information from your Zotero items, and AI assistants such as Claude can use them sequentially, searching for items then retrieving their metadata or text content.
+- `zotero_healthcheck`: Check Zotero API configuration and reachability.
+- `zotero_search_items`: Search items by title/creator/year or full text.
+- `zotero_find_item_by_doi`: Find exact DOI matches, accepting raw DOI,
+  `doi:...`, or `https://doi.org/...`.
+- `zotero_item_metadata`: Get detailed metadata for a Zotero item key.
+- `zotero_item_fulltext`: Get indexed full text from the best available child
+  attachment.
+- `zotero_item_children`: List child notes and attachments for an item.
+- `zotero_list_collections`: List collections with keys and item counts.
+- `zotero_collection_items`: List items in a collection.
+- `zotero_list_tags`: List library tags.
 
-## Installation
+## Recommended setup: local Zotero API
 
-This server can either run against either a [local API offered by the Zotero desktop application](https://groups.google.com/g/zotero-dev/c/ElvHhIFAXrY/m/fA7SKKwsAgAJ)) or through the [Zotero Web API](https://www.zotero.org/support/dev/web_api/v3/start). The local API can be a bit more responsive, but requires that the Zotero app be running on the same computer with the API enabled. To enable the local API, do the following steps:
+This mode keeps your Zotero API traffic on your Mac and does not require a
+Zotero web API key.
 
-1. Open Zotero and open "Zotero Settings"
-1. Under the "Advanced" tab, check the box that says "Allow other applications on this computer to communicate with Zotero".
+1. Open Zotero.
+2. Open Zotero Settings.
+3. Go to Advanced.
+4. Enable "Allow other applications on this computer to communicate with Zotero".
+5. Keep Zotero running while using the MCP server.
 
-> [!IMPORTANT]
-> For access to the `/fulltext` endpoint on the local API which allows retrieving the full content of items in your library, you'll need to install a [Zotero Beta Build](https://www.zotero.org/support/beta_builds) (as of 2025-03-30). Once 7.1 is released this will no longer be the case. See https://github.com/zotero/zotero/pull/5004 for more information. If you do not want to do this, use the Web API instead.
+The local API is available at:
 
-To use the Zotero Web API, you'll need to create an API key and find your Library ID (usually your User ID) in your Zotero account settings here: <https://www.zotero.org/settings/keys>
+```text
+http://localhost:23119/api/
+```
 
-These are the available configuration options:
+For remote/cloud use, the Zotero Web API is still supported through
+`ZOTERO_API_KEY`, `ZOTERO_LIBRARY_ID`, and `ZOTERO_LIBRARY_TYPE`.
 
-- `ZOTERO_LOCAL=true`: Use the local Zotero API (default: false, see note below)
-- `ZOTERO_API_KEY`: Your Zotero API key (not required for the local API)
-- `ZOTERO_LIBRARY_ID`: Your Zotero library ID (your user ID for user libraries, not required for the local API)
-- `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
+## Configuration
 
-### [`uvx`](https://docs.astral.sh/uv/getting-started/installation/) with Local Zotero API
+Environment variables:
 
-To use this with Claude Desktop and a direct python install with [`uvx`](https://docs.astral.sh/uv/getting-started/installation/), add the following to the `mcpServers` configuration:
+- `ZOTERO_LOCAL=true`: Use the local Zotero desktop API.
+- `ZOTERO_API_KEY`: Zotero Web API key. Not required for local mode.
+- `ZOTERO_LIBRARY_ID`: Zotero user or group library ID. In local mode this can
+  be blank; the server uses `0` for the current local user.
+- `ZOTERO_LIBRARY_TYPE`: `user` or `group`. Defaults to `user`.
+
+Example MCP configuration for a local clone:
 
 ```json
 {
   "mcpServers": {
     "zotero": {
-      "command": "uvx",
-      "args": ["--upgrade", "zotero-mcp"],
+      "command": "/path/to/zotero-mcp/.venv/bin/zotero-mcp",
       "env": {
         "ZOTERO_LOCAL": "true",
         "ZOTERO_API_KEY": "",
@@ -60,92 +90,74 @@ To use this with Claude Desktop and a direct python install with [`uvx`](https:/
 }
 ```
 
-The `--upgrade` flag is optional and will pull the latest version when new ones are available. If you don't have `uvx` installed you can use `pipx run` instead, or clone this repository locally and use the instructions in [Development](#development) below.
-
-### Docker with Zotero Web API
-
-If you want to run this MCP server in a Docker container, you can use the following configuration, inserting your API key and library ID:
-
-```json
-{
-  "mcpServers": {
-    "zotero": {
-      "command": "docker",
-      "args": [
-        "run",
-        "--rm",
-        "-i",
-        "-e", "ZOTERO_API_KEY=PLACEHOLDER",
-        "-e", "ZOTERO_LIBRARY_ID=PLACEHOLDER",
-        "ghcr.io/kujenga/zotero-mcp:main"
-      ],
-    }
-  }
-}
-```
-
-To update to a newer version, run `docker pull ghcr.io/kujenga/zotero-mcp:main`. It is also possible to use the docker-based installation to talk to the local Zotero API, but you'll need to modify the above command to ensure that there is network connectivity to the Zotero application's local API interface.
-
 ## Development
 
-Information on making changes and contributing to the project.
+Clone the fork:
 
-1. Clone this repository
-1. Install dependencies with [uv](https://docs.astral.sh/uv/) by running: `uv sync`
-1. Create a `.env` file in the project root with the environment variables above
+```bash
+git clone https://github.com/JGSphaela/zotero-mcp.git
+cd zotero-mcp
+```
 
-Start the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) for local development:
+Install dependencies with `uv`:
+
+```bash
+uv sync
+```
+
+Or use a standard virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e . pytest ruff
+```
+
+Run tests:
+
+```bash
+uv run pytest
+uv run ruff check .
+```
+
+With a virtual environment:
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/python -m ruff check .
+```
+
+Start the MCP Inspector:
 
 ```bash
 npx @modelcontextprotocol/inspector uv run zotero-mcp
 ```
 
-To test the local repository against Claude Desktop, run `echo $PWD/.venv/bin/zotero-mcp` in your shell within this directory, then set the following within your Claude Desktop configuration
-```json
-{
-  "mcpServers": {
-    "zotero": {
-      "command": "/path/to/zotero-mcp/.venv/bin/zotero-mcp"
-      "env": {
-        // Whatever configuration is desired.
-      }
-    }
-  }
-}
-```
+## Roadmap
 
-### Running Tests
+Near-term:
 
-To run the test suite:
+- Structured JSON outputs in addition to human-readable Markdown.
+- Citation export tools for BibTeX and CSL JSON.
+- Better note and annotation extraction.
+- Safer full-text limits and chunking for long PDFs.
 
-```bash
-uv run pytest
-```
+Later, behind explicit write opt-in:
 
-### Docker Development
+- Dry-run PDF import planning.
+- DOI/title metadata repair.
+- Duplicate detection.
+- Collection assignment and tag cleanup.
+- Batch import from messy local PDF folders.
 
-Build the container image with this command:
+## Upstream credit
 
-```sh
-docker build . -t zotero-mcp:local
-```
+This fork builds on [kujenga/zotero-mcp](https://github.com/kujenga/zotero-mcp)
+by Aaron Taylor. The original project established the clean FastMCP/Pyzotero
+foundation used here.
 
-To test the container with the MCP inspector, run the following command:
+## Relevant documentation
 
-```sh
-npx @modelcontextprotocol/inspector \
-    -e ZOTERO_API_KEY=$ZOTERO_API_KEY \
-    -e ZOTERO_LIBRARY_ID=$ZOTERO_LIBRARY_ID \
-    docker run --rm -i \
-        --env ZOTERO_API_KEY \
-        --env ZOTERO_LIBRARY_ID \
-        zotero-mcp:local
-```
-
-## Relevant Documentation
-
-- https://modelcontextprotocol.io/tutorials/building-mcp-with-llms
-- https://github.com/modelcontextprotocol/python-sdk
-- https://pyzotero.readthedocs.io/en/latest/
-- https://www.zotero.org/support/dev/web_api/v3/start
-- https://modelcontextprotocol.io/llms-full.txt can be utilized by LLMs
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk)
+- [Pyzotero](https://pyzotero.readthedocs.io/en/latest/)
+- [Zotero Web API](https://www.zotero.org/support/dev/web_api/v3/start)

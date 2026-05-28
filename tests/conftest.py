@@ -54,3 +54,17 @@ def sample_attachment() -> dict[str, Any]:
             "md5": "123456789",
         },
     }
+
+
+@pytest.fixture
+def sample_collection() -> dict[str, Any]:
+    """Fixture that returns a sample Zotero collection"""
+    return {
+        "key": "COLL1234",
+        "data": {
+            "key": "COLL1234",
+            "name": "Research Papers",
+            "parentCollection": False,
+        },
+        "meta": {"numItems": 12, "numCollections": 2},
+    }

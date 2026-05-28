@@ -1,7 +1,7 @@
 [project]
 name = "zotero-mcp"
-version = "0.1.6"
-description = "Model Context Protocol server for Zotero"
+version = "0.2.0"
+description = "Research-focused Model Context Protocol server for Zotero"
 authors = [{ name = "Aaron Taylor", email = "pypi@ataylor.io" }]
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -27,8 +27,9 @@ dependencies = [
 zotero-mcp = "zotero_mcp.cli:main"
 
 [project.urls]
-Repository = "https://github.com/kujenga/zotero-mcp"
-Issues = "https://github.com/kujenga/zotero-mcp/issues"
+Repository = "https://github.com/JGSphaela/zotero-mcp"
+Issues = "https://github.com/JGSphaela/zotero-mcp/issues"
+Upstream = "https://github.com/kujenga/zotero-mcp"
 
 [build-system]
 requires = ["hatchling"]
