@@ -24,11 +24,13 @@ def sample_item() -> dict[str, Any]:
     """Fixture that returns a sample Zotero item"""
     return {
         "key": "ABCD1234",
+        "version": 100,
         "data": {
             "key": "ABCD1234",
             "itemType": "journalArticle",
             "title": "Test Article",
             "date": "2024",
+            "collections": ["OLD1234"],
             "creators": [
                 {"firstName": "John", "lastName": "Doe"},
                 {"firstName": "Jane", "lastName": "Smith"},
@@ -47,6 +49,7 @@ def sample_attachment() -> dict[str, Any]:
     """Fixture that returns a sample Zotero attachment item"""
     return {
         "key": "XYZ789",
+        "version": 101,
         "data": {
             "key": "XYZ789",
             "itemType": "attachment",
@@ -61,6 +64,7 @@ def sample_collection() -> dict[str, Any]:
     """Fixture that returns a sample Zotero collection"""
     return {
         "key": "COLL1234",
+        "version": 200,
         "data": {
             "key": "COLL1234",
             "name": "Research Papers",

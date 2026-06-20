@@ -13,19 +13,21 @@ more useful as an academic paper knowledge base for LLMs:
 - Collection, tag, child-note, and attachment navigation
 - Chunked full-text reading, within-item search, and heuristic outline/section
   reads for long books
+- Dry-run-first write tools for LLM-assisted collection, tag, metadata, and note
+  organization
 - Friendlier error handling when Zotero is closed or the local API is disabled
 - Tests against current `mcp`, `pyzotero`, and Python 3.13
 
-The current fork is still intentionally read-only. Importing PDFs, editing
-metadata, creating collections, and bulk library cleanup should be added behind
-explicit opt-in write controls.
+Write tools are available, but they are guarded. They default to dry-run and
+only modify Zotero when `ZOTERO_WRITE_ENABLED=true` is set and the individual
+tool call also passes `dry_run=false`.
 
 ## Differences from upstream
 
 | Area | Upstream `kujenga/zotero-mcp` | This fork |
 | --- | --- | --- |
 | Scope | Minimal Zotero read access | Research knowledge-management workflow |
-| Tools | 3 tools | 14 tools |
+| Tools | 3 tools | 23 tools |
 | Diagnostics | Basic exceptions | `zotero_healthcheck` and readable API errors |
 | Citation grounding | Search only | DOI-normalized lookup |
 | Library navigation | Items only | Collections, collection items, tags, child notes, attachments |
@@ -52,6 +54,80 @@ explicit opt-in write controls.
 - `zotero_list_collections`: List collections with keys and item counts.
 - `zotero_collection_items`: List items in a collection.
 - `zotero_list_tags`: List library tags.
+- `zotero_write_status`: Check whether real write operations are enabled.
+- `zotero_create_collection`: Create a collection.
+- `zotero_rename_collection`: Rename a collection.
+- `zotero_delete_collection`: Delete a collection.
+- `zotero_update_item_tags`: Add, remove, or replace item tags.
+- `zotero_update_item_collections`: Add, remove, or replace item collection
+  assignments.
+- `zotero_update_item_metadata`: Patch safe metadata fields on an item.
+- `zotero_create_child_note`: Create a child note under an item.
+- `zotero_apply_organization_plan`: Apply a structured organization plan that
+  combines supported collection, tag, metadata, and note actions.
+
+## Write safety model
+
+Every write tool has two layers of protection:
+
+1. Tools default to `dry_run=true`.
+2. Real writes require `ZOTERO_WRITE_ENABLED=true` in the MCP server
+   environment and `dry_run=false` on the specific tool call.
+
+This means an LLM can freely propose and inspect organization changes without
+modifying Zotero. To apply a plan, enable write mode explicitly:
+
+```json
+{
+  "mcpServers": {
+    "zotero": {
+      "command": "/path/to/zotero-mcp/.venv/bin/zotero-mcp",
+      "env": {
+        "ZOTERO_LOCAL": "true",
+        "ZOTERO_API_KEY": "",
+        "ZOTERO_LIBRARY_ID": "",
+        "ZOTERO_WRITE_ENABLED": "true"
+      }
+    }
+  }
+}
+```
+
+`zotero_update_item_metadata` refuses protected Zotero fields such as `key`,
+`version`, `itemType`, `collections`, `tags`, `relations`, `dateAdded`,
+`dateModified`, and `parentItem`. Use the dedicated tag and collection tools for
+tag and collection changes.
+
+Example organization plan:
+
+```json
+{
+  "create_collections": [
+    {"name": "CMOS VLSI"}
+  ],
+  "rename_collections": [
+    {"collection_key": "OLDKEY", "name": "Digital IC Design"}
+  ],
+  "item_updates": [
+    {
+      "item_key": "ABCD1234",
+      "add_tags": ["cmos", "vlsi"],
+      "remove_tags": ["unsorted"],
+      "add_collection_keys": ["COLL1234"],
+      "metadata": {
+        "abstractNote": "Updated abstract or organization note."
+      }
+    }
+  ],
+  "create_child_notes": [
+    {
+      "parent_item_key": "ABCD1234",
+      "note_text": "Organization rationale for this item.",
+      "tags": ["organization"]
+    }
+  ]
+}
+```
 
 ## Recommended setup: local Zotero API
 
@@ -151,13 +227,13 @@ Near-term:
 - Better note and annotation extraction.
 - Page-aware reads and PDF bookmark extraction when local attachment files are
   available.
+- Richer organization-plan validation and rollback reporting.
 
 Later, behind explicit write opt-in:
 
 - Dry-run PDF import planning.
 - DOI/title metadata repair.
 - Duplicate detection.
-- Collection assignment and tag cleanup.
 - Batch import from messy local PDF folders.
 
 ## Upstream credit

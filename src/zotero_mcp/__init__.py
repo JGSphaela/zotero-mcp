@@ -1,5 +1,7 @@
 import os
 import re
+from copy import deepcopy
+from html import escape
 from math import ceil
 from typing import Any, Literal
 
@@ -14,6 +16,19 @@ DEFAULT_CHUNK_CHARS = 8000
 DEFAULT_CHUNK_OVERLAP = 500
 MAX_CHUNK_CHARS = 25000
 MAX_CONTEXT_CHARS = 2500
+WRITE_ENABLED_ENV = "ZOTERO_WRITE_ENABLED"
+TRUTHY_ENV_VALUES = {"true", "yes", "1", "on"}
+PROTECTED_ITEM_FIELDS = {
+    "key",
+    "version",
+    "itemType",
+    "collections",
+    "tags",
+    "relations",
+    "dateAdded",
+    "dateModified",
+    "parentItem",
+}
 
 
 def strip_note_html(note: str) -> str:
@@ -31,6 +46,109 @@ def normalize_doi(doi: str) -> str:
     )
     normalized = re.sub(r"^doi:\s*", "", normalized, flags=re.IGNORECASE)
     return normalized.strip().rstrip(".").lower()
+
+
+def env_flag(name: str) -> bool:
+    """Return whether an environment flag is explicitly enabled."""
+    return os.getenv(name, "").strip().lower() in TRUTHY_ENV_VALUES
+
+
+def write_enabled() -> bool:
+    """Return whether real Zotero writes are enabled for this MCP server."""
+    return env_flag(WRITE_ENABLED_ENV)
+
+
+def write_guard(dry_run: bool) -> str | None:
+    """Return an error string when a requested real write is not allowed."""
+    if dry_run:
+        return None
+    if write_enabled():
+        return None
+    return (
+        f"Write blocked. Set {WRITE_ENABLED_ENV}=true and call the tool with "
+        "dry_run=false to modify Zotero."
+    )
+
+
+def format_action(title: str, lines: list[str], dry_run: bool) -> str:
+    """Format a dry-run or applied write result."""
+    mode = "Dry Run" if dry_run else "Applied"
+    prefix = [
+        f"# {mode}: {title}",
+    ]
+    if dry_run:
+        prefix.append("No Zotero changes were made.")
+    return "\n".join(prefix + lines)
+
+
+def response_summary(response: Any) -> str:
+    """Format a compact summary for Pyzotero write responses."""
+    if isinstance(response, dict):
+        successful = response.get("successful")
+        failed = response.get("failed")
+        unchanged = response.get("unchanged")
+        parts = []
+        if successful is not None:
+            parts.append(f"successful={len(successful)}")
+        if failed is not None:
+            parts.append(f"failed={len(failed)}")
+        if unchanged is not None:
+            parts.append(f"unchanged={len(unchanged)}")
+        return ", ".join(parts) if parts else "response=JSON object"
+
+    status_code = getattr(response, "status_code", None)
+    reason = getattr(response, "reason_phrase", "")
+    if status_code is not None:
+        return f"HTTP {status_code}" + (f" {reason}" if reason else "")
+    return "write call completed"
+
+
+def unique_strings(values: list[str] | None) -> list[str]:
+    """Deduplicate non-empty strings while preserving order."""
+    if not values:
+        return []
+    result = []
+    seen = set()
+    for value in values:
+        normalized = value.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def tag_names(item: dict[str, Any]) -> list[str]:
+    """Return item tag names from Zotero tag objects."""
+    names = []
+    for tag in item.get("data", {}).get("tags", []):
+        if isinstance(tag, dict) and tag.get("tag"):
+            names.append(str(tag["tag"]))
+        elif isinstance(tag, str):
+            names.append(tag)
+    return names
+
+
+def set_item_tags(item: dict[str, Any], tags: list[str]) -> None:
+    """Set item tags in Zotero's expected list-of-objects shape."""
+    item.setdefault("data", {})["tags"] = [{"tag": tag} for tag in unique_strings(tags)]
+
+
+def collection_keys(item: dict[str, Any]) -> list[str]:
+    """Return collection keys assigned to an item."""
+    return list(item.get("data", {}).get("collections", []) or [])
+
+
+def set_item_collections(item: dict[str, Any], collections: list[str]) -> None:
+    """Set item collection keys in Zotero's expected shape."""
+    item.setdefault("data", {})["collections"] = unique_strings(collections)
+
+
+def note_text_to_html(text: str) -> str:
+    """Convert plain text to the minimal HTML shape Zotero notes expect."""
+    paragraphs = [line.strip() for line in text.splitlines() if line.strip()]
+    if not paragraphs:
+        return ""
+    return "".join(f"<p>{escape(paragraph)}</p>" for paragraph in paragraphs)
 
 
 def clamp_int(value: int | None, default: int, minimum: int, maximum: int) -> int:
@@ -1013,6 +1131,509 @@ def list_tags(limit: int | None = 100) -> str:
         lines.append(f"- `{tag_name}`")
 
     return "\n".join(lines)
+
+
+@mcp.tool(
+    name="zotero_write_status",
+    description="Report whether Zotero write tools are enabled and how to enable real writes.",
+)
+def write_status() -> str:
+    """Report write-mode configuration."""
+    enabled = write_enabled()
+    return "\n".join(
+        [
+            "# Zotero Write Status",
+            f"{WRITE_ENABLED_ENV}: {'enabled' if enabled else 'disabled'}",
+            "Default Tool Mode: dry-run",
+            (
+                "Real writes are allowed when each write call also sets dry_run=false."
+                if enabled
+                else f"Real writes are blocked until {WRITE_ENABLED_ENV}=true is set."
+            ),
+        ]
+    )
+
+
+@mcp.tool(
+    name="zotero_create_collection",
+    description="Create a Zotero collection. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def create_collection(
+    name: str,
+    parent_collection_key: str | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Create a Zotero collection."""
+    name = name.strip()
+    if not name:
+        return "Please provide a collection name."
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+
+    payload = [
+        {
+            "name": name,
+            "parentCollection": (parent_collection_key or "").strip(),
+        }
+    ]
+    lines = [
+        f"Collection Name: {name}",
+        f"Parent Collection: `{parent_collection_key}`"
+        if parent_collection_key
+        else "Parent Collection: top-level",
+    ]
+    if dry_run:
+        return format_action("Create Collection", lines, dry_run=True)
+
+    try:
+        zot = get_zotero_client()
+        response = zot.create_collections(payload)
+    except Exception as e:
+        return f"Error creating Zotero collection: {str(e)}"
+
+    return format_action(
+        "Create Collection", lines + [f"Response: {response_summary(response)}"], False
+    )
+
+
+@mcp.tool(
+    name="zotero_rename_collection",
+    description="Rename a Zotero collection. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def rename_collection(collection_key: str, name: str, dry_run: bool = True) -> str:
+    """Rename a Zotero collection."""
+    collection_key = collection_key.strip()
+    name = name.strip()
+    if not collection_key:
+        return "Please provide a collection key."
+    if not name:
+        return "Please provide a new collection name."
+
+    try:
+        zot = get_zotero_client()
+        collection: Any = zot.collection(collection_key)
+    except Exception as e:
+        return f"Error retrieving Zotero collection: {str(e)}"
+
+    if not collection:
+        return f"No collection found with key: {collection_key}"
+
+    old_name = collection.get("data", {}).get("name", "Untitled Collection")
+    updated = deepcopy(collection)
+    updated.setdefault("data", {})["name"] = name
+    lines = [
+        f"Collection Key: `{collection_key}`",
+        f"Old Name: {old_name}",
+        f"New Name: {name}",
+    ]
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Rename Collection", lines, dry_run=True)
+
+    try:
+        response = zot.update_collection(updated)
+    except Exception as e:
+        return f"Error renaming Zotero collection: {str(e)}"
+
+    return format_action(
+        "Rename Collection", lines + [f"Response: {response_summary(response)}"], False
+    )
+
+
+@mcp.tool(
+    name="zotero_delete_collection",
+    description="Delete a Zotero collection. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def delete_collection(collection_key: str, dry_run: bool = True) -> str:
+    """Delete a Zotero collection."""
+    collection_key = collection_key.strip()
+    if not collection_key:
+        return "Please provide a collection key."
+
+    try:
+        zot = get_zotero_client()
+        collection: Any = zot.collection(collection_key)
+    except Exception as e:
+        return f"Error retrieving Zotero collection: {str(e)}"
+
+    if not collection:
+        return f"No collection found with key: {collection_key}"
+
+    collection_name = collection.get("data", {}).get("name", "Untitled Collection")
+    lines = [
+        f"Collection Key: `{collection_key}`",
+        f"Collection Name: {collection_name}",
+    ]
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Delete Collection", lines, dry_run=True)
+
+    try:
+        response = zot.delete_collection(collection)
+    except Exception as e:
+        return f"Error deleting Zotero collection: {str(e)}"
+
+    return format_action(
+        "Delete Collection", lines + [f"Response: {response_summary(response)}"], False
+    )
+
+
+@mcp.tool(
+    name="zotero_update_item_tags",
+    description="Add, remove, or replace tags on one Zotero item. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def update_item_tags(
+    item_key: str,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+    replace_tags: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Add, remove, or replace tags on a Zotero item."""
+    item_key = item_key.strip()
+    if not item_key:
+        return "Please provide an item key."
+
+    try:
+        zot = get_zotero_client()
+        item: Any = zot.item(item_key)
+    except Exception as e:
+        return f"Error retrieving Zotero item: {str(e)}"
+
+    if not item:
+        return f"No item found with key: {item_key}"
+
+    updated = deepcopy(item)
+    before = tag_names(updated)
+    if replace_tags is not None:
+        after = unique_strings(replace_tags)
+    else:
+        remove_set = set(unique_strings(remove_tags))
+        after = [tag for tag in before if tag not in remove_set]
+        after.extend(unique_strings(add_tags))
+        after = unique_strings(after)
+    set_item_tags(updated, after)
+
+    lines = [
+        f"Item Key: `{item_key}`",
+        f"Title: {item.get('data', {}).get('title', 'Untitled')}",
+        f"Before Tags: {', '.join(before) if before else '(none)'}",
+        f"After Tags: {', '.join(after) if after else '(none)'}",
+    ]
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Update Item Tags", lines, dry_run=True)
+
+    try:
+        response = zot.update_item(updated)
+    except Exception as e:
+        return f"Error updating Zotero item tags: {str(e)}"
+
+    return format_action(
+        "Update Item Tags", lines + [f"Response: {response_summary(response)}"], False
+    )
+
+
+@mcp.tool(
+    name="zotero_update_item_collections",
+    description="Add, remove, or replace collection assignments for one Zotero item. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def update_item_collections(
+    item_key: str,
+    add_collection_keys: list[str] | None = None,
+    remove_collection_keys: list[str] | None = None,
+    replace_collection_keys: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Add, remove, or replace collection assignments on a Zotero item."""
+    item_key = item_key.strip()
+    if not item_key:
+        return "Please provide an item key."
+
+    try:
+        zot = get_zotero_client()
+        item: Any = zot.item(item_key)
+    except Exception as e:
+        return f"Error retrieving Zotero item: {str(e)}"
+
+    if not item:
+        return f"No item found with key: {item_key}"
+
+    updated = deepcopy(item)
+    before = collection_keys(updated)
+    if replace_collection_keys is not None:
+        after = unique_strings(replace_collection_keys)
+    else:
+        remove_set = set(unique_strings(remove_collection_keys))
+        after = [key for key in before if key not in remove_set]
+        after.extend(unique_strings(add_collection_keys))
+        after = unique_strings(after)
+    set_item_collections(updated, after)
+
+    lines = [
+        f"Item Key: `{item_key}`",
+        f"Title: {item.get('data', {}).get('title', 'Untitled')}",
+        f"Before Collections: {', '.join(before) if before else '(none)'}",
+        f"After Collections: {', '.join(after) if after else '(none)'}",
+    ]
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Update Item Collections", lines, dry_run=True)
+
+    try:
+        response = zot.update_item(updated)
+    except Exception as e:
+        return f"Error updating Zotero item collections: {str(e)}"
+
+    return format_action(
+        "Update Item Collections",
+        lines + [f"Response: {response_summary(response)}"],
+        False,
+    )
+
+
+@mcp.tool(
+    name="zotero_update_item_metadata",
+    description="Patch safe metadata fields on one Zotero item. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def update_item_metadata(
+    item_key: str,
+    fields: dict[str, Any],
+    dry_run: bool = True,
+) -> str:
+    """Patch safe metadata fields on a Zotero item."""
+    item_key = item_key.strip()
+    if not item_key:
+        return "Please provide an item key."
+    if not fields:
+        return "Please provide at least one metadata field to update."
+
+    protected = sorted(set(fields).intersection(PROTECTED_ITEM_FIELDS))
+    if protected:
+        return "Refusing to update protected Zotero fields: " + ", ".join(
+            f"`{field}`" for field in protected
+        )
+
+    try:
+        zot = get_zotero_client()
+        item: Any = zot.item(item_key)
+    except Exception as e:
+        return f"Error retrieving Zotero item: {str(e)}"
+
+    if not item:
+        return f"No item found with key: {item_key}"
+
+    updated = deepcopy(item)
+    data = updated.setdefault("data", {})
+    lines = [
+        f"Item Key: `{item_key}`",
+        f"Title: {item.get('data', {}).get('title', 'Untitled')}",
+    ]
+    for field, value in fields.items():
+        before = data.get(field, "")
+        data[field] = value
+        lines.append(f"{field}: `{before}` -> `{value}`")
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Update Item Metadata", lines, dry_run=True)
+
+    try:
+        response = zot.update_item(updated)
+    except Exception as e:
+        return f"Error updating Zotero item metadata: {str(e)}"
+
+    return format_action(
+        "Update Item Metadata",
+        lines + [f"Response: {response_summary(response)}"],
+        False,
+    )
+
+
+@mcp.tool(
+    name="zotero_create_child_note",
+    description="Create a child note under a Zotero item. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def create_child_note(
+    parent_item_key: str,
+    note_text: str,
+    tags: list[str] | None = None,
+    dry_run: bool = True,
+) -> str:
+    """Create a child note under a Zotero item."""
+    parent_item_key = parent_item_key.strip()
+    if not parent_item_key:
+        return "Please provide a parent item key."
+    if not note_text.strip():
+        return "Please provide note text."
+
+    try:
+        zot = get_zotero_client()
+        parent_item: Any = zot.item(parent_item_key)
+    except Exception as e:
+        return f"Error retrieving parent Zotero item: {str(e)}"
+
+    if not parent_item:
+        return f"No parent item found with key: {parent_item_key}"
+
+    note_html = note_text_to_html(note_text)
+    payload = [
+        {
+            "itemType": "note",
+            "note": note_html,
+            "tags": [{"tag": tag} for tag in unique_strings(tags)],
+        }
+    ]
+    lines = [
+        f"Parent Item Key: `{parent_item_key}`",
+        f"Parent Title: {parent_item.get('data', {}).get('title', 'Untitled')}",
+        f"Tags: {', '.join(unique_strings(tags)) if tags else '(none)'}",
+        f"Note Preview: {normalize_whitespace(note_text)[:300]}",
+    ]
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+    if dry_run:
+        return format_action("Create Child Note", lines, dry_run=True)
+
+    try:
+        response = zot.create_items(payload, parentid=parent_item_key)
+    except Exception as e:
+        return f"Error creating Zotero child note: {str(e)}"
+
+    return format_action(
+        "Create Child Note", lines + [f"Response: {response_summary(response)}"], False
+    )
+
+
+@mcp.tool(
+    name="zotero_apply_organization_plan",
+    description="Apply a structured Zotero organization plan. Defaults to dry-run; requires ZOTERO_WRITE_ENABLED=true and dry_run=false to apply.",
+)
+def apply_organization_plan(plan: dict[str, Any], dry_run: bool = True) -> str:
+    """Apply a bounded organization plan generated by an LLM."""
+    if not plan:
+        return "Please provide an organization plan."
+
+    blocked = write_guard(dry_run)
+    if blocked:
+        return blocked
+
+    collection_creates = plan.get("create_collections", []) or []
+    collection_renames = plan.get("rename_collections", []) or []
+    item_updates = plan.get("item_updates", []) or []
+    note_creates = plan.get("create_child_notes", []) or []
+    actions = []
+
+    for collection in collection_creates:
+        actions.append(
+            f"Create collection `{collection.get('name', '')}`"
+            + (
+                f" under `{collection.get('parent_collection_key')}`"
+                if collection.get("parent_collection_key")
+                else ""
+            )
+        )
+    for collection in collection_renames:
+        actions.append(
+            f"Rename collection `{collection.get('collection_key', '')}` to `{collection.get('name', '')}`"
+        )
+    for item in item_updates:
+        item_key = item.get("item_key", "")
+        if item.get("add_tags") or item.get("remove_tags") or item.get("replace_tags"):
+            actions.append(f"Update tags for item `{item_key}`")
+        if (
+            item.get("add_collection_keys")
+            or item.get("remove_collection_keys")
+            or item.get("replace_collection_keys")
+        ):
+            actions.append(f"Update collections for item `{item_key}`")
+        if item.get("metadata"):
+            actions.append(f"Update metadata for item `{item_key}`")
+    for note in note_creates:
+        actions.append(f"Create child note under `{note.get('parent_item_key', '')}`")
+
+    if not actions:
+        return "Organization plan contains no supported actions."
+
+    if dry_run:
+        return format_action("Apply Organization Plan", actions, dry_run=True)
+
+    results = []
+    for collection in collection_creates:
+        results.append(
+            create_collection(
+                str(collection.get("name", "")),
+                collection.get("parent_collection_key"),
+                dry_run=False,
+            )
+        )
+    for collection in collection_renames:
+        results.append(
+            rename_collection(
+                str(collection.get("collection_key", "")),
+                str(collection.get("name", "")),
+                dry_run=False,
+            )
+        )
+    for item in item_updates:
+        item_key = str(item.get("item_key", ""))
+        if item.get("add_tags") or item.get("remove_tags") or item.get("replace_tags"):
+            results.append(
+                update_item_tags(
+                    item_key,
+                    item.get("add_tags"),
+                    item.get("remove_tags"),
+                    item.get("replace_tags"),
+                    dry_run=False,
+                )
+            )
+        if (
+            item.get("add_collection_keys")
+            or item.get("remove_collection_keys")
+            or item.get("replace_collection_keys")
+        ):
+            results.append(
+                update_item_collections(
+                    item_key,
+                    item.get("add_collection_keys"),
+                    item.get("remove_collection_keys"),
+                    item.get("replace_collection_keys"),
+                    dry_run=False,
+                )
+            )
+        if item.get("metadata"):
+            results.append(
+                update_item_metadata(item_key, item.get("metadata", {}), dry_run=False)
+            )
+    for note in note_creates:
+        results.append(
+            create_child_note(
+                str(note.get("parent_item_key", "")),
+                str(note.get("note_text", "")),
+                note.get("tags"),
+                dry_run=False,
+            )
+        )
+
+    return "# Applied: Organization Plan\n\n" + "\n\n---\n\n".join(results)
 
 
 @mcp.tool(
