@@ -1,5 +1,6 @@
 import os
 import re
+from math import ceil
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -8,6 +9,11 @@ from zotero_mcp.client import get_attachment_details, get_zotero_client
 
 # Create an MCP server
 mcp = FastMCP("Zotero")
+
+DEFAULT_CHUNK_CHARS = 8000
+DEFAULT_CHUNK_OVERLAP = 500
+MAX_CHUNK_CHARS = 25000
+MAX_CONTEXT_CHARS = 2500
 
 
 def strip_note_html(note: str) -> str:
@@ -25,6 +31,186 @@ def normalize_doi(doi: str) -> str:
     )
     normalized = re.sub(r"^doi:\s*", "", normalized, flags=re.IGNORECASE)
     return normalized.strip().rstrip(".").lower()
+
+
+def clamp_int(value: int | None, default: int, minimum: int, maximum: int) -> int:
+    """Clamp optional integer MCP inputs to predictable bounds."""
+    if value is None:
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def normalize_whitespace(text: str) -> str:
+    """Collapse indexed full-text whitespace for compact snippets."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def chunk_count(text_length: int, chunk_chars: int, overlap_chars: int) -> int:
+    """Return the number of overlapping chunks for text of a given length."""
+    if text_length <= 0:
+        return 0
+    step = max(1, chunk_chars - overlap_chars)
+    return max(1, ceil(max(0, text_length - chunk_chars) / step) + 1)
+
+
+def chunk_bounds(
+    text_length: int, chunk_index: int, chunk_chars: int, overlap_chars: int
+) -> tuple[int, int]:
+    """Return 0-based character bounds for a 1-based chunk index."""
+    step = max(1, chunk_chars - overlap_chars)
+    start = max(0, (chunk_index - 1) * step)
+    end = min(text_length, start + chunk_chars)
+    return start, end
+
+
+def chunk_index_for_offset(
+    offset: int,
+    chunk_chars: int = DEFAULT_CHUNK_CHARS,
+    overlap_chars: int = DEFAULT_CHUNK_OVERLAP,
+) -> int:
+    """Return the 1-based overlapping chunk containing an offset."""
+    step = max(1, chunk_chars - overlap_chars)
+    return max(1, offset // step + 1)
+
+
+def make_snippet(content: str, center: int, context_chars: int) -> str:
+    """Create a compact text snippet around a character offset."""
+    start = max(0, center - context_chars)
+    end = min(len(content), center + context_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(content) else ""
+    return f"{prefix}{normalize_whitespace(content[start:end])}{suffix}"
+
+
+def tokenize_query(query: str) -> list[str]:
+    """Tokenize a topic query for fallback full-text matching."""
+    return [token.lower() for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", query)]
+
+
+def get_indexed_attachment_text(
+    zot: Any, item_key: str
+) -> tuple[dict[str, Any] | None, Any | None, str | None, str | None]:
+    """Fetch an item, its best attachment, and Zotero's indexed full text."""
+    item: Any = zot.item(item_key)
+    if not item:
+        return None, None, None, f"No item found with key: {item_key}"
+
+    attachment = get_attachment_details(zot, item)
+    if attachment is None:
+        return (
+            item,
+            None,
+            None,
+            "No suitable attachment found for full text extraction. This item may not have any attached files or they may not be in a supported format.",
+        )
+
+    full_text_data: Any = zot.fulltext_item(attachment.key)
+    if not full_text_data or "content" not in full_text_data:
+        return (
+            item,
+            attachment,
+            None,
+            "Attachment is available but indexed text is not available. The document may be scanned as images, not indexed by Zotero yet, or restricted.",
+        )
+
+    return item, attachment, full_text_data["content"], None
+
+
+def iter_lines_with_offsets(content: str) -> list[tuple[int, str]]:
+    """Return stripped non-empty lines with their 0-based character offsets."""
+    lines = []
+    offset = 0
+    for raw_line in content.splitlines(keepends=True):
+        stripped = raw_line.strip()
+        if stripped:
+            line_start = offset + raw_line.find(stripped)
+            lines.append((line_start, normalize_whitespace(stripped)))
+        offset += len(raw_line)
+    return lines
+
+
+def heading_score(line: str) -> int:
+    """Score whether an indexed-text line looks like a structural heading."""
+    if len(line) < 3 or len(line) > 140:
+        return 0
+    if re.fullmatch(r"\d+", line):
+        return 0
+
+    score = 0
+    if re.match(r"^(chapter|section|appendix|part)\b", line, flags=re.IGNORECASE):
+        score += 5
+    if re.match(r"^\d+(?:\.\d+){0,4}\s+\S", line):
+        score += 4
+    if re.search(r"\.{3,}\s*\d+$", line):
+        score += 3
+    alpha_chars = [char for char in line if char.isalpha()]
+    if (
+        alpha_chars
+        and sum(char.isupper() for char in alpha_chars) / len(alpha_chars) > 0.75
+    ):
+        score += 2
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", line)
+    if 1 <= len(words) <= 12 and line[:1].isupper():
+        score += 1
+
+    return score
+
+
+def extract_headings(
+    content: str, limit: int = 80, dedupe: bool = True
+) -> list[dict[str, Any]]:
+    """Extract likely headings or table-of-contents entries from indexed text."""
+    headings = []
+    seen = set()
+    for offset, line in iter_lines_with_offsets(content):
+        score = heading_score(line)
+        if score < 3:
+            continue
+        normalized = line.lower()
+        if dedupe and normalized in seen:
+            continue
+        seen.add(normalized)
+        headings.append(
+            {
+                "title": line,
+                "offset": offset,
+                "score": score,
+                "chunk": chunk_index_for_offset(offset),
+            }
+        )
+        if len(headings) >= limit:
+            break
+    return headings
+
+
+def section_end_offset(
+    headings: list[dict[str, Any]], start: int, content_length: int
+) -> int:
+    """Find the next heading offset after a section start."""
+    for heading in headings:
+        if heading["offset"] > start:
+            return heading["offset"]
+    return content_length
+
+
+def find_heading_matches(
+    headings: list[dict[str, Any]], section_title: str
+) -> list[dict[str, Any]]:
+    """Find likely heading matches for a requested section title."""
+    needle = normalize_whitespace(section_title).lower()
+    if not needle:
+        return []
+    needle_tokens = set(tokenize_query(needle))
+    matches = []
+    for heading in headings:
+        title = heading["title"]
+        haystack = title.lower()
+        haystack_tokens = set(tokenize_query(haystack))
+        if needle in haystack or haystack in needle:
+            matches.append(heading)
+        elif needle_tokens and needle_tokens.issubset(haystack_tokens):
+            matches.append(heading)
+    return matches
 
 
 def creator_summary(data: dict[str, Any], limit: int = 3) -> str:
@@ -301,6 +487,359 @@ def get_item_fulltext(item_key: str) -> str:
 
     except Exception as e:
         return f"Error retrieving item full text: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_item_fulltext_info",
+    description="Get attachment and indexed full-text size information for a Zotero item without returning the full document.",
+)
+def get_item_fulltext_info(
+    item_key: str,
+    chunk_chars: int | None = DEFAULT_CHUNK_CHARS,
+    overlap_chars: int | None = DEFAULT_CHUNK_OVERLAP,
+) -> str:
+    """Get size and chunking information for a Zotero item's indexed text."""
+    chunk_chars = clamp_int(chunk_chars, DEFAULT_CHUNK_CHARS, 1000, MAX_CHUNK_CHARS)
+    overlap_chars = clamp_int(overlap_chars, DEFAULT_CHUNK_OVERLAP, 0, chunk_chars - 1)
+
+    try:
+        zot = get_zotero_client()
+        item, attachment, content, error = get_indexed_attachment_text(zot, item_key)
+    except Exception as e:
+        return f"Error retrieving item full text information: {str(e)}"
+
+    if error:
+        return f"Error: {error}"
+
+    assert item is not None
+    assert attachment is not None
+    assert content is not None
+
+    data = item.get("data", {})
+    text_length = len(content)
+    word_count = len(content.split())
+    total_chunks = chunk_count(text_length, chunk_chars, overlap_chars)
+    first_preview = make_snippet(content, 0, 500)
+    last_preview = make_snippet(content, max(0, text_length - 1), 500)
+
+    return "\n".join(
+        [
+            f"# Full-Text Info: {data.get('title', 'Untitled')}",
+            f"Item Key: `{item_key}`",
+            f"Attachment Key: `{attachment.key}`",
+            f"Attachment Type: {attachment.content_type}",
+            f"Characters: {text_length}",
+            f"Words: ~{word_count}",
+            f"Chunk Size: {chunk_chars} characters",
+            f"Chunk Overlap: {overlap_chars} characters",
+            f"Estimated Chunks: {total_chunks}",
+            "",
+            "## Start Preview",
+            first_preview,
+            "",
+            "## End Preview",
+            last_preview,
+        ]
+    )
+
+
+@mcp.tool(
+    name="zotero_item_text_chunk",
+    description="Read one bounded overlapping chunk of a Zotero item's indexed attachment text. Chunk indexes are 1-based.",
+)
+def get_item_text_chunk(
+    item_key: str,
+    chunk_index: int = 1,
+    chunk_chars: int | None = DEFAULT_CHUNK_CHARS,
+    overlap_chars: int | None = DEFAULT_CHUNK_OVERLAP,
+) -> str:
+    """Read one chunk of indexed full text for long documents."""
+    chunk_chars = clamp_int(chunk_chars, DEFAULT_CHUNK_CHARS, 1000, MAX_CHUNK_CHARS)
+    overlap_chars = clamp_int(overlap_chars, DEFAULT_CHUNK_OVERLAP, 0, chunk_chars - 1)
+    chunk_index = max(1, chunk_index)
+
+    try:
+        zot = get_zotero_client()
+        item, attachment, content, error = get_indexed_attachment_text(zot, item_key)
+    except Exception as e:
+        return f"Error retrieving item text chunk: {str(e)}"
+
+    if error:
+        return f"Error: {error}"
+
+    assert item is not None
+    assert attachment is not None
+    assert content is not None
+
+    total_chunks = chunk_count(len(content), chunk_chars, overlap_chars)
+    if chunk_index > total_chunks:
+        return (
+            f"Requested chunk {chunk_index}, but item `{item_key}` only has "
+            f"{total_chunks} chunk(s) at {chunk_chars} characters with "
+            f"{overlap_chars} overlap."
+        )
+
+    start, end = chunk_bounds(len(content), chunk_index, chunk_chars, overlap_chars)
+    data = item.get("data", {})
+    lines = [
+        f"# Text Chunk {chunk_index}/{total_chunks}: {data.get('title', 'Untitled')}",
+        f"Item Key: `{item_key}`",
+        f"Attachment Key: `{attachment.key}`",
+        f"Character Range: {start}-{end}",
+    ]
+    if chunk_index > 1:
+        lines.append(f"Previous Chunk: {chunk_index - 1}")
+    if chunk_index < total_chunks:
+        lines.append(f"Next Chunk: {chunk_index + 1}")
+    lines.extend(["", "## Content", content[start:end]])
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="zotero_item_search_text",
+    description="Search within one Zotero item's indexed attachment text and return snippets, chunk indexes, and character offsets.",
+)
+def search_item_text(
+    item_key: str,
+    query: str,
+    match_mode: Literal["auto", "phrase", "all_terms", "any_term"] | None = "auto",
+    max_results: int | None = 10,
+    context_chars: int | None = 500,
+) -> str:
+    """Search within a single Zotero item's indexed full text."""
+    max_results = clamp_int(max_results, 10, 1, 25)
+    context_chars = clamp_int(context_chars, 500, 80, MAX_CONTEXT_CHARS)
+    match_mode = match_mode or "auto"
+
+    if not query.strip():
+        return "Please provide a query to search for."
+
+    try:
+        zot = get_zotero_client()
+        item, attachment, content, error = get_indexed_attachment_text(zot, item_key)
+    except Exception as e:
+        return f"Error searching item text: {str(e)}"
+
+    if error:
+        return f"Error: {error}"
+
+    assert item is not None
+    assert attachment is not None
+    assert content is not None
+
+    results = []
+    phrase_matches = list(
+        re.finditer(re.escape(query.strip()), content, flags=re.IGNORECASE)
+    )
+    effective_mode = match_mode
+    if match_mode == "auto":
+        effective_mode = "phrase" if phrase_matches else "all_terms"
+
+    if effective_mode == "phrase":
+        for match in phrase_matches[:max_results]:
+            results.append(
+                {
+                    "offset": match.start(),
+                    "score": 1,
+                    "snippet": make_snippet(content, match.start(), context_chars),
+                }
+            )
+    else:
+        terms = tokenize_query(query)
+        if not terms:
+            return "Please provide at least one searchable word."
+        total_chunks = chunk_count(
+            len(content), DEFAULT_CHUNK_CHARS, DEFAULT_CHUNK_OVERLAP
+        )
+        for chunk_index in range(1, total_chunks + 1):
+            start, end = chunk_bounds(
+                len(content),
+                chunk_index,
+                DEFAULT_CHUNK_CHARS,
+                DEFAULT_CHUNK_OVERLAP,
+            )
+            chunk = content[start:end]
+            chunk_lower = chunk.lower()
+            term_counts = {term: chunk_lower.count(term.lower()) for term in terms}
+            present_terms = [term for term, count in term_counts.items() if count > 0]
+            if effective_mode == "all_terms" and len(present_terms) != len(terms):
+                continue
+            if effective_mode == "any_term" and not present_terms:
+                continue
+            score = sum(term_counts.values())
+            first_match = min(
+                (
+                    chunk_lower.find(term.lower())
+                    for term in present_terms
+                    if chunk_lower.find(term.lower()) >= 0
+                ),
+                default=0,
+            )
+            results.append(
+                {
+                    "offset": start + first_match,
+                    "score": score,
+                    "snippet": make_snippet(
+                        content, start + first_match, context_chars
+                    ),
+                }
+            )
+        results.sort(key=lambda result: (-result["score"], result["offset"]))
+        results = results[:max_results]
+
+    if not results:
+        return f"No indexed-text matches found for `{query}` in item `{item_key}`."
+
+    data = item.get("data", {})
+    header = [
+        f"# Text Search: {query}",
+        f"Item: {data.get('title', 'Untitled')} (`{item_key}`)",
+        f"Attachment: `{attachment.key}`",
+        f"Mode: {effective_mode}",
+        f"Results: {len(results)}",
+    ]
+    formatted_results = []
+    for index, result in enumerate(results, start=1):
+        offset = result["offset"]
+        formatted_results.append(
+            "\n".join(
+                [
+                    f"## {index}. Match",
+                    f"Character Offset: {offset}",
+                    f"Approx. Chunk: {chunk_index_for_offset(offset)}",
+                    f"Score: {result['score']}",
+                    "",
+                    result["snippet"],
+                ]
+            )
+        )
+
+    return "\n\n".join(header + formatted_results)
+
+
+@mcp.tool(
+    name="zotero_item_outline",
+    description="Extract likely headings or table-of-contents entries from a Zotero item's indexed attachment text.",
+)
+def get_item_outline(item_key: str, limit: int | None = 80) -> str:
+    """Extract likely structural headings from indexed text."""
+    limit = clamp_int(limit, 80, 5, 200)
+
+    try:
+        zot = get_zotero_client()
+        item, attachment, content, error = get_indexed_attachment_text(zot, item_key)
+    except Exception as e:
+        return f"Error extracting item outline: {str(e)}"
+
+    if error:
+        return f"Error: {error}"
+
+    assert item is not None
+    assert attachment is not None
+    assert content is not None
+
+    headings = extract_headings(content, limit=limit)
+    if not headings:
+        return (
+            f"No likely headings found in indexed text for item `{item_key}`. "
+            "Try zotero_item_search_text for topic lookup."
+        )
+
+    data = item.get("data", {})
+    lines = [
+        f"# Indexed Text Outline: {data.get('title', 'Untitled')}",
+        f"Item Key: `{item_key}`",
+        f"Attachment Key: `{attachment.key}`",
+        f"Headings Returned: {len(headings)}",
+    ]
+    for index, heading in enumerate(headings, start=1):
+        lines.extend(
+            [
+                "",
+                f"## {index}. {heading['title']}",
+                f"Character Offset: {heading['offset']}",
+                f"Approx. Chunk: {heading['chunk']}",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="zotero_item_read_section",
+    description="Read text under a likely heading or section title from a Zotero item's indexed attachment text.",
+)
+def read_item_section(
+    item_key: str,
+    section_title: str,
+    occurrence: int | None = 1,
+    max_chars: int | None = DEFAULT_CHUNK_CHARS,
+    prefer_longest_match: bool | None = True,
+) -> str:
+    """Read a likely section from a Zotero item's indexed full text."""
+    occurrence = clamp_int(occurrence, 1, 1, 50)
+    max_chars = clamp_int(max_chars, DEFAULT_CHUNK_CHARS, 1000, MAX_CHUNK_CHARS)
+
+    if not section_title.strip():
+        return "Please provide a section title or heading to read."
+
+    try:
+        zot = get_zotero_client()
+        item, attachment, content, error = get_indexed_attachment_text(zot, item_key)
+    except Exception as e:
+        return f"Error reading item section: {str(e)}"
+
+    if error:
+        return f"Error: {error}"
+
+    assert item is not None
+    assert attachment is not None
+    assert content is not None
+
+    headings = extract_headings(content, limit=1000, dedupe=False)
+    matches = find_heading_matches(headings, section_title)
+    if len(matches) < occurrence:
+        return (
+            f"No heading match #{occurrence} found for `{section_title}` in item "
+            f"`{item_key}`. Try zotero_item_outline or zotero_item_search_text."
+        )
+
+    if prefer_longest_match and occurrence == 1:
+        selected = max(
+            matches,
+            key=lambda match: (
+                section_end_offset(headings, match["offset"], len(content))
+                - match["offset"]
+            ),
+        )
+    else:
+        selected = matches[occurrence - 1]
+    start = selected["offset"]
+    next_heading_offset = section_end_offset(headings, start, len(content))
+    if next_heading_offset == len(content):
+        next_heading_offset = None
+
+    end = min(len(content), start + max_chars)
+    if next_heading_offset is not None:
+        end = min(end, next_heading_offset)
+
+    data = item.get("data", {})
+    truncated = end < len(content) and (
+        next_heading_offset is None or end < next_heading_offset
+    )
+    lines = [
+        f"# Section Read: {selected['title']}",
+        f"Item: {data.get('title', 'Untitled')} (`{item_key}`)",
+        f"Attachment: `{attachment.key}`",
+        f"Character Range: {start}-{end}",
+        f"Approx. Chunk: {chunk_index_for_offset(start)}",
+    ]
+    if next_heading_offset is not None:
+        lines.append(f"Next Heading Offset: {next_heading_offset}")
+    if truncated:
+        lines.append("Truncated: true; increase max_chars to read more.")
+    lines.extend(["", "## Content", content[start:end]])
+    return "\n".join(lines)
 
 
 @mcp.tool(

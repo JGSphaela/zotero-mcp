@@ -11,6 +11,8 @@ more useful as an academic paper knowledge base for LLMs:
 - API health checks and setup diagnostics
 - DOI-first lookup for citation grounding
 - Collection, tag, child-note, and attachment navigation
+- Chunked full-text reading, within-item search, and heuristic outline/section
+  reads for long books
 - Friendlier error handling when Zotero is closed or the local API is disabled
 - Tests against current `mcp`, `pyzotero`, and Python 3.13
 
@@ -23,7 +25,7 @@ explicit opt-in write controls.
 | Area | Upstream `kujenga/zotero-mcp` | This fork |
 | --- | --- | --- |
 | Scope | Minimal Zotero read access | Research knowledge-management workflow |
-| Tools | 3 tools | 9 tools |
+| Tools | 3 tools | 14 tools |
 | Diagnostics | Basic exceptions | `zotero_healthcheck` and readable API errors |
 | Citation grounding | Search only | DOI-normalized lookup |
 | Library navigation | Items only | Collections, collection items, tags, child notes, attachments |
@@ -38,6 +40,14 @@ explicit opt-in write controls.
 - `zotero_item_metadata`: Get detailed metadata for a Zotero item key.
 - `zotero_item_fulltext`: Get indexed full text from the best available child
   attachment.
+- `zotero_item_fulltext_info`: Inspect indexed full-text size, attachment
+  details, and estimated chunk count without dumping a whole book into context.
+- `zotero_item_text_chunk`: Read one bounded overlapping chunk of indexed text.
+- `zotero_item_search_text`: Search within one item's indexed text and return
+  snippets, approximate chunk numbers, and character offsets.
+- `zotero_item_outline`: Extract likely headings or table-of-contents entries
+  from indexed text.
+- `zotero_item_read_section`: Read text under a likely heading or section title.
 - `zotero_item_children`: List child notes and attachments for an item.
 - `zotero_list_collections`: List collections with keys and item counts.
 - `zotero_collection_items`: List items in a collection.
@@ -139,7 +149,8 @@ Near-term:
 - Structured JSON outputs in addition to human-readable Markdown.
 - Citation export tools for BibTeX and CSL JSON.
 - Better note and annotation extraction.
-- Safer full-text limits and chunking for long PDFs.
+- Page-aware reads and PDF bookmark extraction when local attachment files are
+  available.
 
 Later, behind explicit write opt-in:
 
